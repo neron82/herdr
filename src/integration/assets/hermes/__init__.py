@@ -11,7 +11,10 @@ import time
 
 _SOURCE = "herdr:hermes"
 _AGENT = "hermes"
-_INTERACTIVE_PLATFORMS = {"cli", "tui", "desktop", "acp"}
+# Hermes runs its chat loop as platform "local" (gateway-managed sessions,
+# including pane-attached CLI clients), and the plain CLI surface passes an
+# empty platform; both are interactive and pane-bound reports must pass.
+_INTERACTIVE_PLATFORMS = {"cli", "tui", "desktop", "acp", "local", ""}
 
 
 def _pane_id() -> str | None:
@@ -49,8 +52,22 @@ def _send_session(session_id: str, start_source: str) -> None:
         pass
 
 
+def _platform(kwargs: dict) -> str:
+    # Hermes CLI leaves agent.platform unset and its lifecycle hooks pass ""
+    # (conversation_loop passes `getattr(agent, "platform", None) or ""`),
+    # while the engine-hook path normalizes the same attribute to "cli"
+    # (agent_init). Inside a Herdr pane the surface is interactive by
+    # definition, so an empty platform must be treated as the CLI surface;
+    # truthy non-interactive values (cron, subagent, gateway channels) stay
+    # filtered out.
+    platform = kwargs.get("platform") or ""
+    if not platform and os.environ.get("HERDR_ENV") == "1":
+        platform = "cli"
+    return platform
+
+
 def _report_session(start_source: str, **kwargs) -> None:
-    if kwargs.get("platform") not in _INTERACTIVE_PLATFORMS:
+    if _platform(kwargs) not in _INTERACTIVE_PLATFORMS:
         return
     session_id = kwargs.get("session_id")
     if not isinstance(session_id, str) or not session_id:
