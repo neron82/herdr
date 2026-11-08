@@ -431,7 +431,7 @@ impl TerminalState {
         }
         if let Some(agent) = agent {
             let agent_label = crate::detect::agent_label(agent);
-            self.reconcile_agent_name_owner(agent_label, None);
+            self.reconcile_agent_name_owner(agent_label, None, false);
         }
         if !process_exited {
             self.clear_full_lifecycle_hook_suppression_for_detected_agent(
@@ -774,7 +774,7 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
-        self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref());
+        self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref(), false);
         if foreground_takeover_allowed {
             self.suppress_current_full_lifecycle_hook_authority(
                 FullLifecycleHookSuppressionReason::HookClear,
@@ -1228,7 +1228,7 @@ impl TerminalState {
         });
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
-            self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+            self.reconcile_agent_name_owner(&agent_label, Some(&session_ref), false);
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
                 source: source.clone(),
                 agent: agent_label,
@@ -1667,7 +1667,11 @@ impl TerminalState {
             );
             self.hook_authority = None;
         }
-        self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+        self.reconcile_agent_name_owner(
+            &agent_label,
+            Some(&session_ref),
+            session_replacement_allowed,
+        );
         let persisted_session = crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
@@ -2354,6 +2358,7 @@ impl TerminalState {
         &mut self,
         agent_label: &str,
         session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        session_replacement_allowed: bool,
     ) {
         if self.agent_name.is_none() {
             return;
@@ -2364,13 +2369,24 @@ impl TerminalState {
             return;
         }
         match self.agent_name_owner.as_mut() {
+            // A different agent type is a different occupant, so the alias goes.
+            Some(owner) if owner.agent_label != agent_label => {
+                self.agent_name = None;
+                self.agent_name_owner = None;
+            }
+            // Same agent type starting a new native session (`/new`, resume,
+            // fork): the pane keeps its address, only the runtime session moves.
+            Some(owner) if session_replacement_allowed => {
+                if owner.session_ref.as_ref() != session_ref {
+                    owner.session_ref = session_ref.cloned();
+                }
+            }
             Some(owner)
-                if owner.agent_label != agent_label
-                    || owner
-                        .session_ref
-                        .as_ref()
-                        .zip(session_ref)
-                        .is_some_and(|(current, incoming)| current != incoming) =>
+                if owner
+                    .session_ref
+                    .as_ref()
+                    .zip(session_ref)
+                    .is_some_and(|(current, incoming)| current != incoming) =>
             {
                 self.agent_name = None;
                 self.agent_name_owner = None;
@@ -5309,7 +5325,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_session_replacement_clears_the_previous_sessions_alias() {
+    fn pi_session_replacement_keeps_the_pane_alias() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         terminal
@@ -5332,6 +5348,43 @@ mod tests {
                 Some("new".into()),
             )
             .expect("new should replace the session");
+
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(
+            terminal
+                .agent_name_owner
+                .as_ref()
+                .and_then(|owner| owner.session_ref.as_ref())
+                .map(|session| session.value.as_str()),
+            Some("pi-new")
+        );
+    }
+
+    #[test]
+    fn agent_type_change_still_clears_the_alias() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::id("pi-old"),
+                Some(20),
+                Some("new".into()),
+            )
+            .expect("initial session should be accepted");
+        terminal.set_agent_name("reviewer".into());
+
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:opencode".into(),
+                "opencode".into(),
+                crate::agent_resume::AgentSessionRef::id("opencode-new"),
+                Some(21),
+                Some("new".into()),
+            )
+            .expect("another agent type should replace the session");
 
         assert!(terminal.agent_name.is_none());
     }
